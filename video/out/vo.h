@@ -471,6 +471,7 @@ struct vo {
         struct vo_wayland_state *wl;
         struct vo_android_state *android;
         struct vo_drm_state *drm;
+        struct vo_ohos_state *ohos;
     };
     struct mp_hwdec_devices *hwdec_devs;
     struct input_ctx *input_ctx;

@@ -28,7 +28,9 @@
 #include <libavutil/opt.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/dovi_meta.h>
 
+#include "config.h"
 #include "mpv_talloc.h"
 #include "common/msg.h"
 #include "options/m_config.h"
@@ -53,6 +55,14 @@
 #include "video/csputils.h"
 #include "video/sws_utils.h"
 #include "video/out/vo.h"
+
+#if HAVE_OHOS
+#include <libavutil/hwcontext_oh.h>
+#include "video/out/ohos_common.h"
+#include <hilog/log.h>
+#define OHOS_LOG_TAG "mpv_vd_lavc"
+#define OHOS_LOG_DOMAIN 0x0000
+#endif
 
 #include "options/m_option.h"
 
@@ -165,7 +175,7 @@ const struct m_sub_options hwdec_conf = {
     .defaults = &(const struct hwdec_opts){
         .software_fallback = 3,
         .hwdec_api = (char *[]){"no", NULL,},
-        .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,prores_raw,ffv1,dpx",
+        .hwdec_codecs = "h264,vc1,hevc,vp8,vp9,av1,prores,ffv1",
         // Maximum number of surfaces the player wants to buffer. This number
         // might require adjustment depending on whatever the player does;
         // for example, if vo_gpu increases the number of reference surfaces for
@@ -213,6 +223,7 @@ typedef struct lavc_ctx {
     bool hwdec_failed;
     bool hwdec_notified;
     bool force_eof;
+    bool dovi_fallback_logged;
 
     bool intra_only;
     int framedrop_flags;
@@ -263,6 +274,7 @@ struct autoprobe_info {
 
 // Things not included in this list will be tried last, in random order.
 const struct autoprobe_info hwdec_autoprobe_info[] = {
+    {"ohcodec",         HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},  // HarmonyOS: auto buffer/surface mode
     {"d3d11va",         HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
     {"vulkan",          HWDEC_FLAG_AUTO | HWDEC_FLAG_WHITELIST},
     {"dxva2",           HWDEC_FLAG_AUTO},
@@ -397,7 +409,23 @@ static void add_all_hwdec_methods(struct hwdec_info **infos, int *num_infos)
                 info.copying = true;
                 if (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
                     info.use_hw_frames = false;
+#if HAVE_OHOS
+                    // For ohcodec-copy (buffer mode): do NOT set hw_device_ctx!
+                    // FFmpeg's ohcodec checks if hw_device_ctx is provided:
+                    // - If hw_device_ctx with native_window != NULL -> surface mode
+                    // - If hw_device_ctx with native_window == NULL -> calls SetSurface(NULL) -> FAILS
+                    // - If NO hw_device_ctx -> buffer mode (outputs NV12, no SetSurface call)
+                    // So for buffer mode, we must not provide hw_device_ctx at all.
+                    if (cfg->device_type == AV_HWDEVICE_TYPE_OHCODEC) {
+                        info.use_hw_device = false;
+                        info.lavc_device = 0;  // Don't create hw device
+                        info.pix_fmt = AV_PIX_FMT_NONE;  // Accept NV12/YUV420P output
+                    } else {
+                        info.use_hw_device = true;
+                    }
+#else
                     info.use_hw_device = true;
+#endif
                 }
                 add_hwdec_item(infos, num_infos, info);
 
@@ -469,8 +497,44 @@ static AVBufferRef *hwdec_create_dev(struct mp_filter *vd,
             };
             return fns->create_dev(vd->global, vd->log, &params);
         } else {
+#if HAVE_OHOS
+            // For ohcodec surface mode: must set native_window BEFORE av_hwdevice_ctx_init
+            // Use alloc + set params + init instead of av_hwdevice_ctx_create
+            if (hwdec->lavc_device == AV_HWDEVICE_TYPE_OHCODEC) {
+                AVBufferRef *ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_OHCODEC);
+                if (!ref) {
+                    MP_ERR(vd, "Failed to alloc ohcodec device\n");
+                    return NULL;
+                }
+                
+                AVHWDeviceContext *device_ctx = (AVHWDeviceContext *)ref->data;
+                AVOHCodecDeviceContext *oh_ctx = (AVOHCodecDeviceContext *)device_ctx->hwctx;
+                
+                bool is_vo_ohcodec = ctx->vo && ctx->vo->driver &&
+                                     strstr(ctx->vo->driver->name, "ohcodec") != NULL;
+                OHNativeWindow *window = is_vo_ohcodec ? vo_ohos_native_window(ctx->vo) : NULL;
+                
+                oh_ctx->native_window = window;
+                // non-NULL = surface mode (outputs AV_PIX_FMT_OHCODEC)
+                // NOTE: For buffer mode (ohcodec-copy), this function should NOT be called
+                
+                MP_VERBOSE(vd, "ohcodec device: window=%p (%s mode)\n",
+                           window, window ? "surface" : "buffer");
+                
+                int ret = av_hwdevice_ctx_init(ref);
+                if (ret < 0) {
+                    MP_ERR(vd, "Failed to init ohcodec device: %s\n", av_err2str(ret));
+                    av_buffer_unref(&ref);
+                    return NULL;
+                }
+                
+                return ref;
+            }
+#endif
             AVBufferRef* ref = NULL;
-            av_hwdevice_ctx_create(&ref, hwdec->lavc_device, NULL, NULL, 0);
+            int ret = av_hwdevice_ctx_create(&ref, hwdec->lavc_device, NULL, NULL, 0);
+            if (ret < 0)
+                return NULL;
             return ref;
         }
     } else if (ctx->hwdec_devs) {
@@ -488,6 +552,41 @@ static AVBufferRef *hwdec_create_dev(struct mp_filter *vd,
         if (hw_ctx && hw_ctx->av_device_ref)
             return av_buffer_ref(hw_ctx->av_device_ref);
     }
+
+#if HAVE_OHOS
+    // Fallback: create ohcodec device based on VO type
+    if (hwdec->lavc_device == AV_HWDEVICE_TYPE_OHCODEC) {
+        AVBufferRef *ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_OHCODEC);
+        if (!ref) {
+            MP_VERBOSE(vd, "Failed to alloc ohcodec device\n");
+            return NULL;
+        }
+        
+        AVHWDeviceContext *device_ctx = (AVHWDeviceContext *)ref->data;
+        AVOHCodecDeviceContext *oh_ctx = (AVOHCodecDeviceContext *)device_ctx->hwctx;
+        
+        // Only use surface mode for vo_ohcodec/ohcodec-osd, buffer mode for everything else
+        bool is_vo_ohcodec = ctx->vo && ctx->vo->driver &&
+                             strstr(ctx->vo->driver->name, "ohcodec") != NULL;
+        OHNativeWindow *window = is_vo_ohcodec ? vo_ohos_native_window(ctx->vo) : NULL;
+
+        oh_ctx->native_window = window;
+
+        MP_INFO(vd, "ohcodec%s fallback device: vo=%s, window=%p (%s mode)\n",
+                hwdec->copying ? "-copy" : "",
+                ctx->vo && ctx->vo->driver ? ctx->vo->driver->name : "null",
+                window, window ? "surface" : "buffer");
+        
+        int ret = av_hwdevice_ctx_init(ref);
+        if (ret < 0) {
+            MP_ERR(vd, "Failed to init ohcodec device: %s\n", av_err2str(ret));
+            av_buffer_unref(&ref);
+            return NULL;
+        }
+        
+        return ref;
+    }
+#endif
 
     return NULL;
 }
@@ -557,6 +656,44 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                 if (hwdec_auto_safe && !(hwdec->flags & HWDEC_FLAG_WHITELIST))
                     continue;
 
+#if HAVE_OHOS
+                // ohcodec mode selection based on VO:
+                // - vo=ohcodec*: use ohcodec surface mode (lavc_device != 0)
+                // - other VOs (gpu-next etc.): use ohcodec-copy buffer mode
+                //
+                // DV/non-DV switching is handled at the app layer, which sets
+                // vo=gpu-next + hwdec=ohcodec-copy for DV content, and
+                // vo=ohcodec-osd + hwdec=auto for non-DV content.
+                //
+                // ohcodec-copy outputs normal software frames (NV12/YUV420P),
+                // just like mediacodec-copy on Android.
+                // Note: ohcodec buffer mode internally converts 10-bit to 8-bit.
+                // Color metadata may be missing, we fix it in receive_frame().
+                if (strstr(hwdec->method_name, "ohcodec")) {
+                    bool is_vo_ohcodec = ctx->vo && ctx->vo->driver &&
+                                         strstr(ctx->vo->driver->name, "ohcodec") != NULL;
+                    bool is_copy_mode = hwdec->copying;
+
+                    if (is_vo_ohcodec) {
+                        // Surface VO (ohcodec / ohcodec-osd): surface mode only
+                        if (is_copy_mode) {
+                            MP_VERBOSE(vd, "Skipping %s for vo=%s\n",
+                                       hwdec->method_name,
+                                       ctx->vo->driver->name);
+                            continue;
+                        }
+                    } else {
+                        // Non-ohcodec VO (gpu-next etc.): copy/buffer mode only
+                        if (!is_copy_mode) {
+                            MP_VERBOSE(vd, "Skipping %s for vo=%s (need ohcodec-copy)\n",
+                                       hwdec->method_name,
+                                       ctx->vo && ctx->vo->driver ? ctx->vo->driver->name : "null");
+                            continue;
+                        }
+                    }
+                }
+#endif
+
                 MP_VERBOSE(vd, "Looking at hwdec %s...\n", hwdec->name);
 
                 /*
@@ -574,10 +711,13 @@ static void select_and_set_hwdec(struct mp_filter *vd)
                     continue;
                 }
 
+                MP_INFO(vd, "Attempting hwdec: %s (lavc_device=%d, copying=%d)\n",
+                        hwdec->name, hwdec->lavc_device, hwdec->copying);
+
                 if (hwdec->lavc_device) {
                     ctx->hwdec_dev = hwdec_create_dev(vd, hwdec, hwdec_auto);
                     if (!ctx->hwdec_dev) {
-                        MP_VERBOSE(vd, "Could not create device.\n");
+                        MP_WARN(vd, "Could not create device for %s.\n", hwdec->name);
                         continue;
                     }
 
@@ -606,6 +746,10 @@ static void select_and_set_hwdec(struct mp_filter *vd)
 
                 ctx->use_hwdec = true;
                 ctx->hwdec = *hwdec;
+                MP_INFO(vd, "Selected hwdec: name=%s, method_name=%s, copying=%d, "
+                        "lavc_device=%d, pix_fmt=%d\n",
+                        ctx->hwdec.name, ctx->hwdec.method_name, ctx->hwdec.copying,
+                        ctx->hwdec.lavc_device, ctx->hwdec.pix_fmt);
                 break;
             }
             if (ctx->use_hwdec)
@@ -747,6 +891,26 @@ static void init_avctx(struct mp_filter *vd)
     int threads = lavc_param->threads;
     if (ctx->use_hwdec) {
         avctx->opaque = vd;
+
+#if HAVE_OHOS
+        // ohcodec-copy (buffer mode): treat it like a normal software decoder
+        // Just like the demo: no hw_device_ctx, no hwaccel_flags, no get_format
+        // The h264_ohcodec/hevc_ohcodec decoder will automatically output NV12
+        bool is_ohcodec_copy = ctx->hwdec.copying &&
+                               strstr(ctx->hwdec.method_name, "ohcodec") != NULL;
+        if (is_ohcodec_copy) {
+            // Buffer mode: don't set any hwaccel flags or hw contexts
+            // This matches how the demo uses FFmpeg ohcodec in buffer mode
+            MP_INFO(vd, "ohcodec-copy: using buffer mode (no hw_device_ctx)\n");
+            // Set max_delay_queue same as other hwdec copying modes
+            ctx->max_delay_queue = HWDEC_DELAY_QUEUE_COUNT;
+            // Disable hw_probing to avoid packet accumulation during init
+            ctx->hw_probing = false;
+            threads = ctx->hwdec_opts->hwdec_threads;
+            goto skip_hwdec_setup;
+        }
+#endif
+
         avctx->hwaccel_flags |= AV_HWACCEL_FLAG_IGNORE_LEVEL;
         if (!lavc_param->check_hw_profile)
             avctx->hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
@@ -790,9 +954,22 @@ static void init_avctx(struct mp_filter *vd)
 #endif
     }
 
+#if HAVE_OHOS
+skip_hwdec_setup:
+#endif
+
     mp_set_avcodec_threads(vd->log, avctx, threads);
 
-    if (!ctx->use_hwdec && ctx->vo && lavc_param->dr) {
+    // Enable Direct Rendering for software decoding or ohcodec-copy
+    bool enable_dr = !ctx->use_hwdec;
+#if HAVE_OHOS
+    // ohcodec-copy outputs to system memory, can use DR
+    if (ctx->use_hwdec && ctx->hwdec.copying &&
+        strstr(ctx->hwdec.method_name, "ohcodec"))
+        enable_dr = true;
+#endif
+
+    if (enable_dr && ctx->vo && lavc_param->dr) {
         avctx->opaque = vd;
         avctx->get_buffer2 = get_buffer2_direct;
     }
@@ -899,6 +1076,19 @@ static void flush_all(struct mp_filter *vd)
     for (int n = 0; n < ctx->num_requeue_packets; n++)
         talloc_free(ctx->requeue_packets[n]);
     ctx->num_requeue_packets = 0;
+
+#if HAVE_OHOS
+    // Clear pools to release buffer references (important for ohcodec buffer mode)
+    if (ctx->use_hwdec && ctx->hwdec.copying) {
+        mp_mutex_lock(&ctx->dr_lock);
+        if (ctx->dr_pool)
+            mp_image_pool_clear(ctx->dr_pool);
+        mp_mutex_unlock(&ctx->dr_lock);
+
+        if (ctx->hwdec_swpool)
+            mp_image_pool_clear(ctx->hwdec_swpool);
+    }
+#endif
 
     reset_avctx(vd);
 }
@@ -1025,6 +1215,25 @@ static enum AVPixelFormat get_format_hwdec(struct AVCodecContext *avctx,
             break;
         }
     }
+
+#if HAVE_OHOS
+    // ohcodec-copy (buffer mode): decoder outputs NV12/YUV420P directly
+    // Just like mediacodec-copy on Android.
+    if (select == AV_PIX_FMT_NONE &&
+        ctx->hwdec.copying &&
+        strcmp(ctx->hwdec.method_name, "ohcodec-copy") == 0) {
+        for (int i = 0; fmt[i] != AV_PIX_FMT_NONE; i++) {
+            if (fmt[i] == AV_PIX_FMT_NV12 ||
+                fmt[i] == AV_PIX_FMT_NV21 ||
+                fmt[i] == AV_PIX_FMT_YUV420P) {
+                select = fmt[i];
+                MP_VERBOSE(vd, "ohcodec-copy: selected %s\n",
+                           av_get_pix_fmt_name(select));
+                break;
+            }
+        }
+    }
+#endif
 
     if (select == AV_PIX_FMT_NONE)
         ctx->hwdec_failed = true;
@@ -1213,6 +1422,55 @@ static void send_queued_packet(struct mp_filter *vd)
     }
 }
 
+// Get dv_bl_signal_compatibility_id from codec parameters side data.
+// This determines the base layer type (HDR10, HLG, SDR, etc.).
+static uint8_t get_dovi_compat_id(struct mp_codec_params *codec)
+{
+    if (!codec->lav_codecpar)
+        return 0;
+    AVCodecParameters *par = codec->lav_codecpar;
+    for (int i = 0; i < par->nb_coded_side_data; i++) {
+        if (par->coded_side_data[i].type == AV_PKT_DATA_DOVI_CONF &&
+            par->coded_side_data[i].size >= sizeof(AVDOVIDecoderConfigurationRecord))
+        {
+            const AVDOVIDecoderConfigurationRecord *cfg =
+                (const void *)par->coded_side_data[i].data;
+            return cfg->dv_bl_signal_compatibility_id;
+        }
+    }
+    return 0;
+}
+
+// Inject Dolby Vision color space for ohcodec-copy frames lacking RPU metadata.
+// Only runs when ohdec.c failed to attach AV_FRAME_DATA_DOVI_METADATA
+// (guard: repr.sys != PL_COLOR_SYSTEM_DOLBYVISION).
+static void inject_dovi_colorspace(struct mp_filter *vd, struct mp_image *mpi)
+{
+    vd_ffmpeg_ctx *ctx = vd->priv;
+    uint8_t dv_profile = ctx->codec->dv_profile;
+    uint8_t compat_id = get_dovi_compat_id(ctx->codec);
+
+    // OHCodec converts IPTPQc2 → BT.2020 YCbCr internally,
+    // so output is always BT.2020 NCL regardless of DV profile.
+    mpi->params.color.primaries = PL_COLOR_PRIM_BT_2020;
+    mpi->params.repr.sys = PL_COLOR_SYSTEM_BT_2020_NC;
+    mpi->params.color.transfer = (compat_id == 4) ? PL_COLOR_TRC_HLG
+                                                   : PL_COLOR_TRC_PQ;
+    if (dv_profile == 5 || (dv_profile == 7 && compat_id == 0))
+        mpi->params.repr.levels = PL_COLOR_LEVELS_LIMITED;
+
+    if (!mpi->params.color.hdr.max_luma) {
+        mpi->params.color.hdr.min_luma = 0.005f;
+        mpi->params.color.hdr.max_luma = 1000.0f;
+    }
+
+    if (!ctx->dovi_fallback_logged) {
+        MP_INFO(vd, "DV profile %d (compat %d): fallback %s colorspace\n",
+                dv_profile, compat_id, (compat_id == 4) ? "HLG" : "PQ");
+        ctx->dovi_fallback_logged = true;
+    }
+}
+
 // Returns whether decoder is still active (!EOF state).
 static int decode_frame(struct mp_filter *vd)
 {
@@ -1271,6 +1529,15 @@ static int decode_frame(struct mp_filter *vd)
     mpi->pkt_duration = mp_pts_from_av(ctx->pic->duration, &ctx->codec_timebase);
 
     av_frame_unref(ctx->pic);
+
+    // Inject Dolby Vision color space ONLY for ohcodec-copy (buffer mode).
+    // Surface mode renders directly and must NOT have its color params modified,
+    // or it will break the VO pipeline.
+    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi &&
+        mpi->params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
+    {
+        inject_dovi_colorspace(vd, mpi);
+    }
 
     MP_TARRAY_APPEND(ctx, ctx->delay_queue, ctx->num_delay_queue, mpi);
     return ret;
@@ -1336,6 +1603,43 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
             return AVERROR_UNKNOWN;
         }
     }
+
+#if HAVE_OHOS
+    // ohcodec buffer mode: use container color info as fallback
+    // The hardware decoder may not set color metadata on output frames,
+    // so we fill in missing values from the container-level codec params.
+    if (ctx->use_hwdec && ctx->hwdec.copying &&
+        strstr(ctx->hwdec.method_name, "ohcodec")) {
+        struct mp_codec_params *c = ctx->codec;
+
+        // Fix color primaries
+        if (res->params.color.primaries == PL_COLOR_PRIM_UNKNOWN &&
+            c->color.primaries != PL_COLOR_PRIM_UNKNOWN)
+            res->params.color.primaries = c->color.primaries;
+
+        // Fix transfer function
+        if (res->params.color.transfer == PL_COLOR_TRC_UNKNOWN &&
+            c->color.transfer != PL_COLOR_TRC_UNKNOWN)
+            res->params.color.transfer = c->color.transfer;
+
+        // Fix color system (colorspace/matrix)
+        if (res->params.repr.sys == PL_COLOR_SYSTEM_UNKNOWN &&
+            c->repr.sys != PL_COLOR_SYSTEM_UNKNOWN)
+            res->params.repr.sys = c->repr.sys;
+
+        // Fix color levels (range)
+        if (res->params.repr.levels == PL_COLOR_LEVELS_UNKNOWN &&
+            c->repr.levels != PL_COLOR_LEVELS_UNKNOWN)
+            res->params.repr.levels = c->repr.levels;
+
+        // Fix pixel aspect ratio
+        if ((res->params.p_w <= 0 || res->params.p_h <= 0) &&
+            c->par_w > 0 && c->par_h > 0) {
+            res->params.p_w = c->par_w;
+            res->params.p_h = c->par_h;
+        }
+    }
+#endif
 
     if (!ctx->hwdec_notified) {
         if (ctx->use_hwdec) {
