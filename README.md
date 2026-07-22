@@ -1,3 +1,7 @@
+## Used by
+
+- **[HosPlayer](https://appgallery.huawei.com/app/detail?id=com.colorlifee.hosplayer)** - 一个简单的视频播放器。
+
 ![mpv logo](https://raw.githubusercontent.com/mpv-player/mpv.io/master/source/images/mpv-logo-128.png)
 
 # mpv
