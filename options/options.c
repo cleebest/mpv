@@ -248,9 +248,6 @@ static const m_option_t mp_vo_opt_list[] = {
 #if HAVE_EGL_ANDROID
     {"android-surface-size", OPT_SIZE_BOX(android_surface_size)},
 #endif
-#if HAVE_EGL_OHOS
-    {"ohos-surface-size", OPT_SIZE_BOX(ohos_surface_size)},
-#endif
 #if HAVE_D3D11
     {"d3d11-composition-size", OPT_SIZE_BOX(d3d11_composition_size)},
 #endif
@@ -937,7 +934,7 @@ static const m_option_t mp_opts[] = {
     {"", OPT_SUBSTRUCT(opengl_opts, opengl_conf)},
 #endif
 
-#if HAVE_EGL || HAVE_EGL_ANDROID || HAVE_EGL_ANGLE_WIN32 || HAVE_EGL_OHOS
+#if HAVE_EGL || HAVE_EGL_ANDROID || HAVE_EGL_ANGLE_WIN32
     {"egl", OPT_SUBSTRUCT(egl_opts, egl_conf)},
 #endif
 
