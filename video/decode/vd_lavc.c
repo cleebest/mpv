@@ -1442,22 +1442,8 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         }
     }
 
-    // Inject DV colorspace for any hwdec mode with DOVI codec.
-    // Removed copying guard temporarily to diagnose if it's the blocker.
-    if (ctx->use_hwdec && ctx->codec->dovi) {
-        // Always write to /data/local/tmp (doesn't need storage permission)
-        // and also try /sdcard/ as fallback.
-        FILE *f = fopen("/data/local/tmp/mpv_dovi.txt", "a");
-        if (!f) f = fopen("/sdcard/mpv_dovi.txt", "a");
-        if (f) {
-            fprintf(f, "hwdec=%d copying=%d dovi=%d dvp=%d prim=%d sys=%d trc=%d lvl=%d hwctx=%p\n",
-                    ctx->use_hwdec, ctx->hwdec.copying, ctx->codec->dovi,
-                    ctx->codec->dv_profile,
-                    res->params.color.primaries, res->params.repr.sys,
-                    res->params.color.transfer, res->params.repr.levels,
-                    (void*)res->hwctx);
-            fclose(f);
-        }
+    // Inject DV colorspace for hwdec-copy DV content.
+    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi) {
         inject_dovi_colorspace(vd, res);
     }
 
