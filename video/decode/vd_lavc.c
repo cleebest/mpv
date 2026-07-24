@@ -1442,15 +1442,25 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         }
     }
 
-    // DEBUG: Force-override colors for any DV hwdec-copy frame to verify
-    // the code path is reached. Removing all guards temporarily.
-    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi) {
-        MP_ERR(vd, "DOVI_DEBUG: forcing BT.2020/PQ for dv_profile=%d, "
-               "cur_primaries=%d, cur_sys=%d, cur_transfer=%d",
-               ctx->codec->dv_profile,
-               res->params.color.primaries, res->params.repr.sys,
-               res->params.color.transfer);
-        inject_dovi_colorspace(vd, res);
+    // DEBUG: Write color state to /sdcard/mpv_dovi_debug.txt for diagnosis.
+    // Also force-override colors for DV hwdec-copy to verify code is reached.
+    {
+        bool dv_trigger = (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi);
+        FILE *f = fopen("/sdcard/mpv_dovi_debug.txt", "a");
+        if (f) {
+            fprintf(f, "frame: use_hwdec=%d copying=%d dovi=%d dv_profile=%d "
+                    "primaries=%d sys=%d transfer=%d levels=%d hwctx=%p "
+                    "trigger=%d\n",
+                    ctx->use_hwdec, ctx->hwdec.copying, ctx->codec->dovi,
+                    ctx->codec->dv_profile,
+                    res->params.color.primaries, res->params.repr.sys,
+                    res->params.color.transfer, res->params.repr.levels,
+                    (void*)res->hwctx, dv_trigger);
+            fclose(f);
+        }
+        if (dv_trigger) {
+            inject_dovi_colorspace(vd, res);
+        }
     }
 
     // Use container color metadata as fallback for hwdec-copy modes.
