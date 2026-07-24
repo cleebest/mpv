@@ -1443,17 +1443,20 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
     }
 
     // Inject Dolby Vision color space for hwdec-copy modes when RPU metadata
-    // is missing. Must run AFTER mp_image_hw_download() because the download
-    // creates a new software image and may not propagate color params from
-    // the source hardware frame.
+    // is missing or incomplete. Must run AFTER mp_image_hw_download() because
+    // the download creates a new software image and may discard color params
+    // from the source hardware frame.
     //
-    // Guard on primaries==UNKNOWN rather than sys!=DOLBYVISION because
-    // Android MediaCodec may set sys=DOLBYVISION as a false positive without
-    // actual RPU data. Only inject when the frame genuinely lacks color info.
-    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi &&
-        res->params.color.primaries == PL_COLOR_PRIM_UNKNOWN)
+    // Only skip injection when the frame has definitive DV RPU evidence:
+    // both sys=DOLBYVISION AND primaries=BT.2020. Any other combination
+    // (sys=DOLBYVISION+primaries=BT.709/UNKNOWN, or sys=anything_else)
+    // means RPU data is missing or incomplete, so we inject the fallback.
+    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi)
     {
-        inject_dovi_colorspace(vd, res);
+        bool has_proper_rpu = (res->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                               res->params.color.primaries == PL_COLOR_PRIM_BT_2020);
+        if (!has_proper_rpu)
+            inject_dovi_colorspace(vd, res);
     }
 
     // Use container color metadata as fallback for hwdec-copy modes.
