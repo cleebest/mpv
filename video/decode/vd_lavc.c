@@ -1446,10 +1446,17 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
     // is missing. Must run AFTER mp_image_hw_download() because the download
     // creates a new software image and may not propagate color params from
     // the source hardware frame.
-    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi &&
-        res->params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
+    //
+    // On Android, MediaCodec may set repr.sys=DOLBYVISION as a false positive
+    // without actual RPU data. We check primaries to distinguish real DV
+    // metadata (has both sys=DOLBYVISION and valid primaries) from fake
+    // (sys=DOLBYVISION but primaries=UNKNOWN, meaning no real RPU attached).
+    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi)
     {
-        inject_dovi_colorspace(vd, res);
+        bool has_real_dovi_rpu = (res->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
+                                  res->params.color.primaries != PL_COLOR_PRIM_UNKNOWN);
+        if (!has_real_dovi_rpu)
+            inject_dovi_colorspace(vd, res);
     }
 
     // Use container color metadata as fallback for hwdec-copy modes.
