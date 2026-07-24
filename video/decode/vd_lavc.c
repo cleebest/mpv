@@ -1442,21 +1442,15 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         }
     }
 
-    // Inject Dolby Vision color space for hwdec-copy modes when RPU metadata
-    // is missing or incomplete. Must run AFTER mp_image_hw_download() because
-    // the download creates a new software image and may discard color params
-    // from the source hardware frame.
-    //
-    // Only skip injection when the frame has definitive DV RPU evidence:
-    // both sys=DOLBYVISION AND primaries=BT.2020. Any other combination
-    // (sys=DOLBYVISION+primaries=BT.709/UNKNOWN, or sys=anything_else)
-    // means RPU data is missing or incomplete, so we inject the fallback.
-    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi)
-    {
-        bool has_proper_rpu = (res->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION &&
-                               res->params.color.primaries == PL_COLOR_PRIM_BT_2020);
-        if (!has_proper_rpu)
-            inject_dovi_colorspace(vd, res);
+    // DEBUG: Force-override colors for any DV hwdec-copy frame to verify
+    // the code path is reached. Removing all guards temporarily.
+    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi) {
+        MP_ERR(vd, "DOVI_DEBUG: forcing BT.2020/PQ for dv_profile=%d, "
+               "cur_primaries=%d, cur_sys=%d, cur_transfer=%d",
+               ctx->codec->dv_profile,
+               res->params.color.primaries, res->params.repr.sys,
+               res->params.color.transfer);
+        inject_dovi_colorspace(vd, res);
     }
 
     // Use container color metadata as fallback for hwdec-copy modes.
