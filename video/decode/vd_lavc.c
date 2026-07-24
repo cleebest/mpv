@@ -1286,12 +1286,24 @@ static void inject_dovi_colorspace(struct mp_filter *vd, struct mp_image *mpi)
     uint8_t compat_id = get_dovi_compat_id(ctx->codec);
 
     // Hardware DV decoders (MediaCodec, NVDEC, etc.) convert IPTPQc2 to
-    // BT.2020 YCbCr internally, so output is BT.2020 NCL regardless of profile.
+    // BT.2020 YCbCr internally, so output is BT.2020 NCL regardless of
+    // profile. Set color params for correct rendering.
+
+    // BT.2020 primaries + PQ transfer are the safe defaults for all DV
+    // profiles when hardware decoders strip RPU metadata.
     mpi->params.color.primaries = PL_COLOR_PRIM_BT_2020;
     mpi->params.repr.sys = PL_COLOR_SYSTEM_BT_2020_NC;
+
+    // compat_id tells us the base layer type: 0=HDR10(PQ), 1=SDR, 2=HDR10,
+    // 4=HLG. For P5 (no base layer), compat_id is typically 0 or 2.
+    // Use PQ as default; only use HLG when explicitly signaled via compat_id=4.
     mpi->params.color.transfer = (compat_id == 4) ? PL_COLOR_TRC_HLG
                                                    : PL_COLOR_TRC_PQ;
-    if (dv_profile == 5 || (dv_profile == 7 && compat_id == 0))
+
+    // DV P5 and P7 BL use limited range YCbCr after HW decode.
+    // Also treat dv_profile==0 (unknown) with dovi flag set as likely P5.
+    if (dv_profile == 0 || dv_profile == 5 || dv_profile == 7 ||
+        dv_profile == 8 || dv_profile == 10)
         mpi->params.repr.levels = PL_COLOR_LEVELS_LIMITED;
 
     if (!mpi->params.color.hdr.max_luma) {
@@ -1300,7 +1312,7 @@ static void inject_dovi_colorspace(struct mp_filter *vd, struct mp_image *mpi)
     }
 
     if (!ctx->dovi_fallback_logged) {
-        MP_INFO(vd, "DV profile %d (compat %d): fallback %s colorspace\n",
+        MP_INFO(vd, "DV profile %d (compat %d): inject BT.2020 %s colorspace\n",
                 dv_profile, compat_id, (compat_id == 4) ? "HLG" : "PQ");
         ctx->dovi_fallback_logged = true;
     }
@@ -1365,17 +1377,6 @@ static int decode_frame(struct mp_filter *vd)
 
     av_frame_unref(ctx->pic);
 
-    // Inject Dolby Vision color space for hwdec-copy modes when RPU metadata
-    // is missing. Hardware decoders (MediaCodec, NVDEC, etc.) may convert
-    // IPTPQc2 to BT.2020 YCbCr internally without attaching proper DOVI metadata,
-    // so we supply fallback color params from the codec's DV configuration.
-    // Surface/zero-copy modes must NOT have color params modified.
-    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi &&
-        mpi->params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
-    {
-        inject_dovi_colorspace(vd, mpi);
-    }
-
     MP_TARRAY_APPEND(ctx, ctx->delay_queue, ctx->num_delay_queue, mpi);
     return ret;
 }
@@ -1439,6 +1440,16 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
             handle_err(vd);
             return AVERROR_UNKNOWN;
         }
+    }
+
+    // Inject Dolby Vision color space for hwdec-copy modes when RPU metadata
+    // is missing. Must run AFTER mp_image_hw_download() because the download
+    // creates a new software image and may not propagate color params from
+    // the source hardware frame.
+    if (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi &&
+        res->params.repr.sys != PL_COLOR_SYSTEM_DOLBYVISION)
+    {
+        inject_dovi_colorspace(vd, res);
     }
 
     // Use container color metadata as fallback for hwdec-copy modes.
