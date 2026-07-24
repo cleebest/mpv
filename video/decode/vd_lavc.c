@@ -1442,25 +1442,23 @@ static int receive_frame(struct mp_filter *vd, struct mp_frame *out_frame)
         }
     }
 
-    // DEBUG: Write color state to /sdcard/mpv_dovi_debug.txt for diagnosis.
-    // Also force-override colors for DV hwdec-copy to verify code is reached.
-    {
-        bool dv_trigger = (ctx->use_hwdec && ctx->hwdec.copying && ctx->codec->dovi);
-        FILE *f = fopen("/sdcard/mpv_dovi_debug.txt", "a");
+    // Inject DV colorspace for any hwdec mode with DOVI codec.
+    // Removed copying guard temporarily to diagnose if it's the blocker.
+    if (ctx->use_hwdec && ctx->codec->dovi) {
+        // Always write to /data/local/tmp (doesn't need storage permission)
+        // and also try /sdcard/ as fallback.
+        FILE *f = fopen("/data/local/tmp/mpv_dovi.txt", "a");
+        if (!f) f = fopen("/sdcard/mpv_dovi.txt", "a");
         if (f) {
-            fprintf(f, "frame: use_hwdec=%d copying=%d dovi=%d dv_profile=%d "
-                    "primaries=%d sys=%d transfer=%d levels=%d hwctx=%p "
-                    "trigger=%d\n",
+            fprintf(f, "hwdec=%d copying=%d dovi=%d dvp=%d prim=%d sys=%d trc=%d lvl=%d hwctx=%p\n",
                     ctx->use_hwdec, ctx->hwdec.copying, ctx->codec->dovi,
                     ctx->codec->dv_profile,
                     res->params.color.primaries, res->params.repr.sys,
                     res->params.color.transfer, res->params.repr.levels,
-                    (void*)res->hwctx, dv_trigger);
+                    (void*)res->hwctx);
             fclose(f);
         }
-        if (dv_trigger) {
-            inject_dovi_colorspace(vd, res);
-        }
+        inject_dovi_colorspace(vd, res);
     }
 
     // Use container color metadata as fallback for hwdec-copy modes.
